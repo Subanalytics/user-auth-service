@@ -181,7 +181,7 @@ jobs:
         with:
           repository: subanalytics/infra-and-cicd
           path: infra-and-cicd
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ secrets.CI_PAT }}
 
       - name: Download build info
         uses: actions/download-artifact@v4
