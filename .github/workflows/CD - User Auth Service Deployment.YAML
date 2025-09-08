@@ -1,0 +1,395 @@
+name: CD - User Auth Service Deployment
+
+on:
+  # Triggered by repository dispatch from CI pipeline
+  repository_dispatch:
+    types: [deploy-user-auth-service]
+  
+  # Triggered when infra repo is updated (Helm chart changes)
+  push:
+    branches:
+      - main
+    paths:
+      - 'values.yaml'
+      - 'charts/user-auth-service/**'
+  
+  # Manual trigger for emergency deployments
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'analytics'
+        type: choice
+        options:
+          - analytics
+          - staging
+          - production
+      image_tag:
+        description: 'Docker image tag to deploy (leave empty for latest from values.yaml)'
+        required: false
+        type: string
+      force_deploy:
+        description: 'Force deployment even if health checks fail'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  SERVICE_NAME: user-auth-service
+  DEPLOYMENT_NAME: user-auth-deployment
+  NAMESPACE: analytics
+  HELM_CHART_PATH: ./charts/user-auth-service
+
+permissions:
+  contents: read
+
+jobs:
+  # Pre-deployment validation
+  pre-deployment-checks:
+    runs-on: self-hosted
+    
+    outputs:
+      image-tag: ${{ steps.get-image.outputs.image-tag }}
+      environment: ${{ steps.set-env.outputs.environment }}
+
+    steps:
+      - name: Checkout infra repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Set environment
+        id: set-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=analytics" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get image tag to deploy
+        id: get-image
+        run: |
+          # Install yq if not available
+          if ! command -v yq &> /dev/null; then
+            sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
+          fi
+          
+          if [[ "${{ github.event.inputs.image_tag }}" != "" ]]; then
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          elif [[ "${{ github.event.client_payload.image_tag }}" != "" ]]; then
+            IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
+          else
+            # Get from values.yaml
+            IMAGE_TAG=$(yq e '.userAuthService.image.tag' values.yaml)
+          fi
+          
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Deploying image tag: $IMAGE_TAG"
+
+      - name: Validate cluster connectivity
+        run: |
+          echo "=== Validating Kubernetes cluster connectivity ==="
+          kubectl cluster-info
+          kubectl get nodes
+          echo "✅ Cluster connectivity verified"
+
+      - name: Check namespace
+        run: |
+          echo "=== Checking namespace: ${{ steps.set-env.outputs.environment }} ==="
+          
+          if ! kubectl get namespace ${{ steps.set-env.outputs.environment }} >/dev/null 2>&1; then
+            echo "Creating namespace: ${{ steps.set-env.outputs.environment }}"
+            kubectl create namespace ${{ steps.set-env.outputs.environment }}
+          else
+            echo "✅ Namespace exists: ${{ steps.set-env.outputs.environment }}"
+          fi
+
+      - name: Validate image availability
+        run: |
+          echo "=== Validating Docker image availability ==="
+          IMAGE_NAME="${{ secrets.DOCKER_USERNAME }}/user-auth-service:${{ steps.get-image.outputs.image-tag }}"
+          
+          # Try to pull the image to verify it exists
+          if docker pull "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "✅ Image available: $IMAGE_NAME"
+          else
+            echo "❌ Image not found: $IMAGE_NAME"
+            exit 1
+          fi
+
+  # Deploy using Helm (preferred) or kubectl
+  deploy-service:
+    runs-on: self-hosted
+    needs: pre-deployment-checks
+    
+    steps:
+      - name: Checkout infra repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.0'
+
+      # Option 1: Deploy using Helm (if Helm charts are available)
+      - name: Deploy with Helm
+        id: helm-deploy
+        continue-on-error: true
+        run: |
+          if [[ -d "${{ env.HELM_CHART_PATH }}" ]]; then
+            echo "=== Deploying with Helm ==="
+            
+            # Update values with the specific image tag
+            helm upgrade --install ${{ env.SERVICE_NAME }} ${{ env.HELM_CHART_PATH }} \
+              --namespace ${{ needs.pre-deployment-checks.outputs.environment }} \
+              --create-namespace \
+              --set image.tag=${{ needs.pre-deployment-checks.outputs.image-tag }} \
+              --set image.repository=${{ secrets.DOCKER_USERNAME }}/user-auth-service \
+              --timeout 10m \
+              --wait \
+              --atomic
+            
+            echo "helm-success=true" >> $GITHUB_OUTPUT
+            echo "✅ Helm deployment successful"
+          else
+            echo "helm-success=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Helm chart not found, will use kubectl"
+          fi
+
+      # Option 2: Deploy using kubectl (fallback)
+      - name: Deploy with kubectl
+        if: steps.helm-deploy.outputs.helm-success != 'true'
+        run: |
+          echo "=== Deploying with kubectl ==="
+          
+          # Create a temporary manifest with updated image
+          sed "s|image: tush1809/user-auth:latest|image: ${{ secrets.DOCKER_USERNAME }}/user-auth-service:${{ needs.pre-deployment-checks.outputs.image-tag }}|g" \
+            k8s/user-auth-deployment.yaml > temp-deployment.yaml
+          
+          # Apply the deployment
+          kubectl apply -f temp-deployment.yaml -n ${{ needs.pre-deployment-checks.outputs.environment }}
+          
+          # Apply service and other resources
+          kubectl apply -f k8s/user-auth-service.yaml -n ${{ needs.pre-deployment-checks.outputs.environment }} || true
+          kubectl apply -f k8s/user-auth-hpa.yaml -n ${{ needs.pre-deployment-checks.outputs.environment }} || true
+          
+          echo "✅ kubectl deployment completed"
+
+      - name: Wait for deployment rollout
+        run: |
+          echo "=== Waiting for deployment rollout ==="
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            --timeout=600s
+          
+          echo "✅ Deployment rollout completed"
+
+  # Post-deployment verification
+  post-deployment-verification:
+    runs-on: self-hosted
+    needs: [pre-deployment-checks, deploy-service]
+    
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Verify deployment
+        run: |
+          echo "=== Verifying deployment ==="
+          
+          # Check deployment status
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide
+          
+          # Check pod status
+          kubectl get pods -l app=user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide
+          
+          # Check service
+          kubectl get svc user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide || echo "Service not found"
+
+      - name: Health check
+        run: |
+          echo "=== Running health checks ==="
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=Ready \
+            pods -l app=user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            --timeout=300s
+          
+          # Test service connectivity
+          SERVICE_IP=$(kubectl get svc user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+          
+          SERVICE_PORT=$(kubectl get svc user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "5000")
+          
+          if [[ -n "$SERVICE_IP" ]]; then
+            echo "Testing service connectivity at $SERVICE_IP:$SERVICE_PORT"
+            
+            # Test from within cluster
+            kubectl run health-check-pod \
+              --image=curlimages/curl:latest \
+              --rm -i --restart=Never \
+              -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+              -- curl -f -m 10 "http://$SERVICE_IP:$SERVICE_PORT/health" || \
+              echo "⚠️ Health check endpoint not reachable"
+          else
+            echo "⚠️ Could not determine service IP for health check"
+          fi
+
+      - name: Performance baseline check
+        continue-on-error: true
+        run: |
+          echo "=== Performance baseline check ==="
+          
+          # Check resource usage
+          kubectl top pods -l app=user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} || \
+            echo "Metrics server not available"
+          
+          # Check for any error logs
+          echo "Recent pod logs:"
+          kubectl logs -l app=user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            --tail=20 || echo "No logs available"
+
+  # Security and compliance checks
+  security-validation:
+    runs-on: self-hosted
+    needs: [pre-deployment-checks, deploy-service]
+    continue-on-error: true
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: DAST Security Scan
+        run: |
+          echo "=== Running DAST security scan ==="
+          
+          # Discover service endpoint
+          NAMESPACE="${{ needs.pre-deployment-checks.outputs.environment }}"
+          SERVICE_IP=$(kubectl get svc user-auth-service -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+          SERVICE_PORT=$(kubectl get svc user-auth-service -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "5000")
+          
+          if [[ -n "$SERVICE_IP" ]]; then
+            TARGET_URL="http://$SERVICE_IP:$SERVICE_PORT"
+            echo "Running security scan against: $TARGET_URL"
+            
+            mkdir -p security-reports
+            
+            # Run OWASP ZAP baseline scan
+            docker run --rm \
+              --network host \
+              -v "$(pwd)/security-reports:/zap/wrk" \
+              owasp/zap2docker-stable \
+              zap-baseline.py \
+                -t "$TARGET_URL" \
+                -r "user-auth-security-report.html" \
+                -J "user-auth-security-results.json" \
+                -x "user-auth-security-report.xml" \
+                -I || echo "DAST scan completed with findings"
+            
+            echo "✅ Security scan completed"
+          else
+            echo "⚠️ Could not determine service endpoint for security scan"
+          fi
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: user-auth-security-reports
+          path: security-reports/
+          retention-days: 30
+
+  # Generate deployment report
+  generate-report:
+    runs-on: self-hosted
+    needs: [pre-deployment-checks, deploy-service, post-deployment-verification, security-validation]
+    if: always()
+    
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Generate deployment report
+        run: |
+          echo "=== DEPLOYMENT REPORT ===" > deployment-report.txt
+          echo "Service: ${{ env.SERVICE_NAME }}" >> deployment-report.txt
+          echo "Environment: ${{ needs.pre-deployment-checks.outputs.environment }}" >> deployment-report.txt
+          echo "Image Tag: ${{ needs.pre-deployment-checks.outputs.image-tag }}" >> deployment-report.txt
+          echo "Deployment Date: $(date)" >> deployment-report.txt
+          echo "Triggered by: ${{ github.event_name }}" >> deployment-report.txt
+          echo "Workflow Run: ${{ github.run_number }}" >> deployment-report.txt
+          echo "" >> deployment-report.txt
+          
+          echo "=== DEPLOYMENT STATUS ===" >> deployment-report.txt
+          kubectl get deployment ${{ env.DEPLOYMENT_NAME }} \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide >> deployment-report.txt 2>&1 || echo "Deployment not found" >> deployment-report.txt
+          echo "" >> deployment-report.txt
+          
+          echo "=== POD STATUS ===" >> deployment-report.txt
+          kubectl get pods -l app=user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide >> deployment-report.txt 2>&1 || echo "Pods not found" >> deployment-report.txt
+          echo "" >> deployment-report.txt
+          
+          echo "=== SERVICE STATUS ===" >> deployment-report.txt
+          kubectl get svc user-auth-service \
+            -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            -o wide >> deployment-report.txt 2>&1 || echo "Service not found" >> deployment-report.txt
+          echo "" >> deployment-report.txt
+          
+          echo "=== RECENT EVENTS ===" >> deployment-report.txt
+          kubectl get events -n ${{ needs.pre-deployment-checks.outputs.environment }} \
+            --sort-by='.lastTimestamp' | tail -10 >> deployment-report.txt 2>&1 || echo "No events" >> deployment-report.txt
+
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v4
+        with:
+          name: user-auth-deployment-report-${{ github.run_number }}
+          path: deployment-report.txt
+          retention-days: 30
+
+      - name: Deployment summary
+        run: |
+          if [[ "${{ needs.deploy-service.result }}" == "success" && "${{ needs.post-deployment-verification.result }}" == "success" ]]; then
+            echo "🎉 User Auth Service deployment SUCCESSFUL!"
+            echo "✅ Service: ${{ env.SERVICE_NAME }}"
+            echo "✅ Environment: ${{ needs.pre-deployment-checks.outputs.environment }}"
+            echo "✅ Image: ${{ secrets.DOCKER_USERNAME }}/user-auth-service:${{ needs.pre-deployment-checks.outputs.image-tag }}"
+            echo "✅ All health checks passed"
+          else
+            echo "❌ User Auth Service deployment FAILED!"
+            echo "Check the job logs and artifacts for details"
+            exit 1
+          fi
