@@ -15,11 +15,48 @@ spec:
       labels:
         app: user-auth-service
     spec:
+      serviceAccountName: user-auth-sa
       containers:
         - name: user-auth
           image: tush1809/user-auth:latest
           ports:
             - containerPort: 5000
+          env:
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-secrets
+                  key: MONGO_URI
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-secrets
+                  key: JWT_SECRET
+            - name: FLASK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-secrets
+                  key: FLASK_URL
+            - name: CORS_ORIGIN
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-secrets
+                  key: CORS_ORIGIN
+            - name: NODE_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-config
+                  key: NODE_ENV
+            - name: TOKEN_EXPIRY
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-config
+                  key: TOKEN_EXPIRY
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-config
+                  key: DB_NAME
           resources:
             requests:
               cpu: 100m
